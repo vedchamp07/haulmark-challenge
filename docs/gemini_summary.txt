@@ -1,0 +1,24 @@
+This video serves as an orientation for the Mindshift Fuel Efficiency Challenge, which focuses on predicting fuel consumption for mining dumpers.
+
+Project Overview
+
+    Primary Objective: Predict the fuel consumed (in liters) by dumpers within a specific shift.
+    Operating Context: The mining operation runs on three shifts per day (C, A, and B), and dumpers perform cyclical "haul cycles" involving loading, hauling, dumping, and returning.
+    Key Variables: Fuel efficiency is influenced by three main categories:
+        Exposure: Engine hours.
+        Terrain: Distance, vertical lift, altitude variations, and angle changes.
+        Behavior: Stoppage density and speed variations, which may relate to traffic or operator habits.
+
+Data Understanding & Management
+
+    Telemetry Data: Contains granular data (e.g., fuel volume, position, battery, altitude) collected every 5 to 60 seconds.
+    Manual Data: Includes shift-wise information like operator IDs, hour meter readings (HMR), and total trips pulled from Daily Production Reports (DPR).
+    Refueling Data: RFID records provide accurate refueling amounts. Participants are instructed to clean the data by isolating "phantom" refueling events and managing anomalies, such as sensor spikes or data gaps.
+    Advanced Features:
+        Dump Switch: Available for some dumpers, providing a definitive signal (via analog input) when the dump body is raised.
+        Spatial Analytics: Participants can infer loading locations by matching dumper coordinates with fixed excavator locations (identified by "EXC" labels).
+
+Evaluation Logistics
+
+    The competition will move from a day-level to a shift-level evaluation to ensure accuracy, as different operators work different shifts.
+    A secondary, more advanced phase of the competition may involve attributing fuel usage to external factors like congestion, which will be detailed in future documentation.

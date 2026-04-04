@@ -16,18 +16,27 @@
 
 | Strategy | OOF RMSE (active) | LB MSE | File |
 |---|---|---|---|
-| **v4: Two-stage + fixed spatial + accel** | **27.13L ← BEST OOF** | pending | `submissions/submission_v4_oof27.13_mean152.8.csv` |
-| v3: Two-stage + spatial (broken) + operator | 27.47L | **957.06 ← BEST LB** | `submissions/submission_v3_oof27.47_mean152.9.csv` |
-| v2: LGB + ext_voltage + interactions | 50.73L | 3182.71 | `submissions/submission_spatial_oof48.87_mean152.6.csv` |
+| **v6: v4 pipeline + v5 features** | **27.18L** | pending | `submissions/submission_v6_oof27.18_mean152.9.csv` |
+| v5: State machine + altitude + broken CV | 22.24L (time-CV, inconsistent) | WORSE | `submissions/submission_v5_oof22.24_mean152.3.csv` |
+| v4: Two-stage + fixed spatial + accel | 27.13L (GroupKFold) | **940.99 ← BEST LB** | `submissions/submission_v4_oof27.13_mean152.8.csv` |
+| v3: Two-stage + spatial (broken) + operator | 27.47L (leaky) | **940.99 / 957.06** | `submissions/submission_v3_oof27.47_mean152.9.csv` |
+| v2: LGB + ext_voltage + interactions | 50.73L | 3182.71 | archive |
 | v1: LGB baseline (telemetry-only) | 46.26L | 3551.51 | archive |
 | Leaky ensemble (DO NOT SUBMIT) | 16.79L | ~10,000 | archive |
 
-**LB metric is MSE (not RMSE)**. Top score on leaderboard: **391 MSE** (≈19.8L RMSE). 10th place: 594 MSE. We are currently ~24th.
+**LB metric is MSE (not RMSE)**. Top score on leaderboard: **391 MSE** (≈19.8L RMSE). 10th place: 594 MSE.
+
+**v5 got WORSE LB score** despite better OOF. Root cause: time-based CV makes training use 15-day vehicle history but test uses 60-day history → train/test feature distributions differ. GroupKFold is correct; the "leakage" in veh_shift_mean_acons is actually valid because same vehicles appear in train and test.
+
+**v5 features ARE good** (altitude_gain_m ranked #7, n_dump_events #11 in v5). The CV change is what broke it.
+**Recommended next step: add altitude_gain_m + altitude_loss_m to v4, keep everything else identical.**
 
 **Key lessons**:
 - OOF RMSE (active only) is the right CV metric — the two-stage model separates inactive shifts (acons≈0) from active ones, so OOF on active shifts only is meaningful
-- The spatial zone features (`frac_dump_v4`, `frac_haul_v4`) were **all zero in v3** due to wrong gpkg filename (`mine001_anonymized.gpkg` vs actual `mine_001_anonymized.gpkg`). Fixed in v4.
+- **GroupKFold by vehicle is correct** — `veh_shift_mean_acons` is a legitimate look-up (same vehicles in test), not real leakage
+- `altitude_gain_m` (corr 0.387) is the strongest untapped signal — stronger than all spatial zone features
 - `external_voltage × moving_hours` is consistently the #1 feature
+- See `docs/PIPELINE_V4_GUIDE.md` for comprehensive pipeline documentation
 - Leaky features (`initlev`, `endlev`, `arefill`) cause catastrophic LB failure
 
 ---
@@ -212,27 +221,28 @@ From `docs/orientation_notes.txt`:
 
 ---
 
-## Running v4 Locally
+## Running v6 Locally (CURRENT BEST)
 
 ```bash
 source ~/.venv/bin/activate
 
-# Step 1: Extract patch features from raw parquets (~5 min)
-python scripts/build_v4_patch_features.py
-# Output: ckpts/train_v4.parquet, ckpts/test_v4.parquet
+# Step 1: Extract v5 patch features from raw parquets (~8-12 min)
+# (Already done if ckpts/train_v5.parquet exists)
+python scripts/build_v5_features.py
+# Output: ckpts/train_v5.parquet (83 cols), ckpts/test_v5.parquet
 
-# Step 2: Train model and generate submission (~3 min)
-python scripts/train_v4.py
-# Output: submissions/submission_v4_oof{X}_mean{Y}.csv
+# Step 2: Train v6 model (v4 pipeline + v5 features) (~3 min)
+python scripts/train_v6.py
+# Output: submissions/submission_v6_oof27.18_mean152.9.csv
 ```
 
 ### Checkpoints
 - `ckpts/train_feats_checkpoint.parquet` — v3 features (68 cols, spatial broken)
-- `ckpts/test_feats_checkpoint.parquet`  — v3 features (68 cols, spatial broken)
-- `ckpts/train_v4.parquet` — v4 features (73 cols, spatial fixed)
-- `ckpts/test_v4.parquet`  — v4 features (73 cols, spatial fixed)
+- `ckpts/train_v4.parquet` — v4 features (73 cols, spatial fixed, broken stubs)
+- `ckpts/train_v5.parquet` — v5 features (83 cols, + state machine + altitude) ← START HERE
+- `ckpts/test_v5.parquet`  — v5 test features (83 cols)
 
-These checkpoints save ~28 minutes of telemetry processing. Always start from v4 checkpoints.
+**v5 builds on v4**: `build_v5_features.py` loads v4 checkpoints and adds new features on top.
 
 ---
 
@@ -248,8 +258,10 @@ Use `scripts/kaggle_v3_submission.py` as the base. Key fix needed for v5:
 
 | File | Purpose |
 |---|---|
-| `scripts/build_v4_patch_features.py` | **Re-extracts spatial+accel features from raw parquets** |
-| `scripts/train_v4.py` | **Current best: two-stage LGB from v4 checkpoints** |
+| `scripts/build_v5_features.py` | **Re-extracts all features (v4 + altitude + state machine)** |
+| `scripts/train_v6.py` | **Current best: v4 pipeline on v5 checkpoints** |
+| `scripts/build_v4_patch_features.py` | v4 spatial+accel feature extraction (superseded by v5) |
+| `scripts/train_v4.py` | v4 training script (superseded by v6) |
 | `scripts/kaggle_v3_submission.py` | Kaggle-ready end-to-end script (spatial bug fixed in v4 branch) |
 | `scripts/analyze_for_improvement.py` | EDA script — acons distribution, total_trip, lph, missing rows |
 | `scripts/eda_for_final_run.py` | EDA script — spatial geometry audit, gpkg bbox check |

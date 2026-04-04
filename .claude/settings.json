@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3)",
+      "Read(//Users/vedantn/**)",
+      "Bash(ls -la /Users/vedantn/Hackathon/.venv*/)"
+    ]
+  }
+}

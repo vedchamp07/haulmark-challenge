@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""
-Spatial + Cycle Detection Feature Pipeline.
+"""Spatial + Cycle Detection Feature Pipeline.
 
-New features based on orientation notes:
-1. Spatial zone features from .gpkg (time in dump/load/haul zones)
-2. Haul cycle detection (load → haul → dump → empty → load)
-3. Excavator proximity for loading event detection
-4. Load-state features (loaded vs empty haul speed/distance)
-5. Dump event count via spatial transitions (for Jan/Feb without analog signal)
+This script is intentionally self-contained and produces *test-available* features.
+
+Key features:
+    - Time fractions in dump/load/haul zones (from mine .gpkg)
+    - Excavator proximity as a loading proxy (mean excavator anchors per mine)
+    - Dump/load/haul transitions (zone entry counts)
+    - Cycle proxies from dump switch (when present) and spatial transitions
 
 Outputs:
-- outputs/spatial_features/train_spatial.csv
-- outputs/spatial_features/test_spatial.csv
+    - outputs/spatial_features/train_spatial.csv
+    - outputs/spatial_features/test_spatial.csv
+
+Performance notes:
+    - Uses cached per-file parts under outputs/spatial_features/parts/ so you can
+        interrupt and resume without losing progress.
 """
 
 from __future__ import annotations
@@ -33,6 +37,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 OUTPUT = ROOT / "outputs" / "spatial_features"
 OUTPUT.mkdir(parents=True, exist_ok=True)
+PARTS_DIR = OUTPUT / "parts"
+PARTS_DIR.mkdir(parents=True, exist_ok=True)
 
 TEST_FILES = {
     "telemetry_2026-01-21_2026-01-31.parquet",
@@ -123,23 +129,41 @@ def add_zone_flags_vectorized(df: pd.DataFrame, mine_layers: dict) -> pd.DataFra
     # Process per mine
     for mine, layers in mine_layers.items():
         mask = df["mine_anon"].astype(str).str.lower() == mine
-        if mask.sum() == 0:
+        n_mine = int(mask.sum())
+        if n_mine == 0:
             continue
 
-        pts = gpd.GeoSeries(
-            gpd.points_from_xy(x[mask], y[mask]), crs="EPSG:32645"
-        )
+        x_m = x[mask]
+        y_m = y[mask]
 
-        def within(union):
-            if union is None:
-                return np.zeros(mask.sum(), dtype=bool)
-            return pts.within(union).to_numpy()
+        if "speed" in df.columns:
+            spd_m = pd.to_numeric(df.loc[mask, "speed"], errors="coerce").fillna(0).to_numpy(dtype=float)
+        else:
+            spd_m = np.zeros(n_mine, dtype=float)
+
+        def within(union_geom, extra_mask: np.ndarray | None = None):
+            if union_geom is None:
+                return np.zeros(n_mine, dtype=bool)
+
+            minx, miny, maxx, maxy = union_geom.bounds
+            bbox = (x_m >= minx) & (x_m <= maxx) & (y_m >= miny) & (y_m <= maxy)
+            if extra_mask is not None:
+                bbox = bbox & extra_mask
+            if bbox.sum() == 0:
+                return np.zeros(n_mine, dtype=bool)
+
+            pts_sub = gpd.GeoSeries(gpd.points_from_xy(x_m[bbox], y_m[bbox]), crs="EPSG:32645")
+            inside_sub = pts_sub.within(union_geom).to_numpy()
+            out = np.zeros(n_mine, dtype=bool)
+            out[bbox] = inside_sub
+            return out
 
         in_ob  = within(layers["ob_dump_union"])
         in_rom = within(layers["stock_union"])
         in_dum = in_ob | in_rom
         in_lod = within(layers["bench_union"]) | within(layers["cpu_union"])
-        on_hau = within(layers["haul_union"])
+        moving = spd_m > 2.0
+        on_hau = within(layers["haul_union"], extra_mask=moving)
 
         df.loc[mask, "in_dump_zone"]     = in_dum.astype(np.int8)
         df.loc[mask, "in_ob_dump_zone"]  = in_ob.astype(np.int8)
@@ -151,62 +175,80 @@ def add_zone_flags_vectorized(df: pd.DataFrame, mine_layers: dict) -> pd.DataFra
 
 
 # ─────────────────────────────────────────────────────────────────
-# Excavator helpers
+# Excavator helpers (FAST)
 # ─────────────────────────────────────────────────────────────────
 
-def extract_excavator_positions(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    From a telemetry chunk, extract per-(mine, date, shift) excavator positions.
-    Excavators barely move — median lat/lon is their operating location.
-    """
-    exc = df[df["vehicle"].astype(str).str.startswith("Exc")].copy()
-    if exc.empty:
-        return pd.DataFrame(columns=["mine_anon", "date", "shift",
-                                     "exc_x_utm", "exc_y_utm", "exc_vehicle"])
-    exc = exc[exc["speed"] < 2].copy()  # only pings where stationary
-    if exc.empty:
-        return pd.DataFrame(columns=["mine_anon", "date", "shift",
-                                     "exc_x_utm", "exc_y_utm", "exc_vehicle"])
+def compute_excavator_mean_positions(data_dir: Path, telemetry_files: list[Path]) -> dict[str, np.ndarray]:
+    """Compute stable excavator anchors per mine (UTM coordinates).
 
-    x, y = to_utm(exc["latitude"].to_numpy(dtype=float),
-                  exc["longitude"].to_numpy(dtype=float))
-    exc["x_utm"] = x
-    exc["y_utm"] = y
+    We intentionally use a single anchor set per mine (not per shift) because:
+      - excavators move little relative to the mine scale
+      - it avoids expensive per-(date,shift) nested loops
+    """
+    frames = []
+    use_cols = ["vehicle", "mine_anon", "latitude", "longitude", "speed"]
+    for f in telemetry_files:
+        try:
+            df = pd.read_parquet(f, columns=use_cols)
+        except Exception:
+            df = pd.read_parquet(f)
+            df = df[[c for c in use_cols if c in df.columns]].copy()
 
-    pos = (
-        exc.groupby(["vehicle", "mine_anon", "date", "shift"], observed=True)
-        .agg(exc_x_utm=("x_utm", "median"), exc_y_utm=("y_utm", "median"))
+        if "vehicle" not in df.columns:
+            continue
+        exc = df[df["vehicle"].astype(str).str.startswith("Exc")].copy()
+        if exc.empty:
+            continue
+        if "speed" in exc.columns:
+            exc = exc[pd.to_numeric(exc["speed"], errors="coerce").fillna(0) < 2].copy()
+        frames.append(exc[[c for c in ["vehicle", "mine_anon", "latitude", "longitude"] if c in exc.columns]])
+
+    if not frames:
+        return {"mine001": np.empty((0, 2), dtype=float), "mine002": np.empty((0, 2), dtype=float)}
+
+    exc_all = pd.concat(frames, ignore_index=True)
+    exc_all = exc_all.dropna(subset=["vehicle", "mine_anon", "latitude", "longitude"]).copy()
+    if exc_all.empty:
+        return {"mine001": np.empty((0, 2), dtype=float), "mine002": np.empty((0, 2), dtype=float)}
+
+    mean = (
+        exc_all.groupby(["vehicle", "mine_anon"], observed=True)
+        .agg(lat=("latitude", "mean"), lon=("longitude", "mean"))
         .reset_index()
-        .rename(columns={"vehicle": "exc_vehicle"})
     )
-    return pos
+    x, y = to_utm(mean["lat"].to_numpy(dtype=float), mean["lon"].to_numpy(dtype=float))
+    mean["x_utm"] = x
+    mean["y_utm"] = y
+
+    out: dict[str, np.ndarray] = {}
+    for mine_id in ["mine001", "mine002"]:
+        sub = mean[mean["mine_anon"].astype(str).str.lower() == mine_id]
+        out[mine_id] = sub[["x_utm", "y_utm"]].to_numpy(dtype=float)
+    return out
 
 
-def add_excavator_proximity(df: pd.DataFrame, exc_pos: pd.DataFrame) -> pd.DataFrame:
-    """Mark each dumper ping as near-excavator (loading zone) or not."""
+def add_excavator_proximity_fast(df: pd.DataFrame, exc_positions_utm: dict[str, np.ndarray]) -> pd.DataFrame:
+    """Vectorized proximity-to-excavator using per-mine anchor points."""
     df = df.copy()
     df["near_excavator"] = 0
-
-    if exc_pos.empty or "x_utm" not in df.columns:
+    if "x_utm" not in df.columns or "y_utm" not in df.columns:
         return df
 
-    for mine, mine_exc in exc_pos.groupby("mine_anon", observed=True):
-        # Get all unique excavator positions for this mine
-        mine_mask = df["mine_anon"].astype(str).str.lower() == str(mine).lower()
-        if mine_mask.sum() == 0:
+    for mine_id, anchors in exc_positions_utm.items():
+        if anchors is None or len(anchors) == 0:
+            continue
+        mask = df["mine_anon"].astype(str).str.lower() == mine_id
+        if mask.sum() == 0:
             continue
 
-        # Per date+shift, check proximity to each excavator operating in that shift
-        for (date, shift), shift_exc in mine_exc.groupby(["date", "shift"], observed=True):
-            row_mask = mine_mask & (df["date"] == date) & (df["shift"] == shift)
-            if row_mask.sum() == 0:
-                continue
-
-            dx = df.loc[row_mask, "x_utm"].to_numpy() - shift_exc["exc_x_utm"].to_numpy()[:, None]
-            dy = df.loc[row_mask, "y_utm"].to_numpy() - shift_exc["exc_y_utm"].to_numpy()[:, None]
-            dist2 = dx**2 + dy**2  # shape: (n_exc, n_pings)
-            near = (dist2 < EXC_PROXIMITY_M**2).any(axis=0)
-            df.loc[row_mask, "near_excavator"] = near.astype(np.int8)
+        x = df.loc[mask, "x_utm"].to_numpy(dtype=float)
+        y = df.loc[mask, "y_utm"].to_numpy(dtype=float)
+        # distance to nearest anchor
+        dx = x[:, None] - anchors[:, 0][None, :]
+        dy = y[:, None] - anchors[:, 1][None, :]
+        dist2 = dx * dx + dy * dy
+        near = (dist2.min(axis=1) < EXC_PROXIMITY_M**2)
+        df.loc[mask, "near_excavator"] = near.astype(np.int8)
 
     return df
 
@@ -216,10 +258,7 @@ def add_excavator_proximity(df: pd.DataFrame, exc_pos: pd.DataFrame) -> pd.DataF
 # ─────────────────────────────────────────────────────────────────
 
 def aggregate_shift_spatial(g: pd.DataFrame) -> pd.Series:
-    """
-    Aggregate per-shift spatial + cycle features.
-    Input: all telemetry rows for one (vehicle, date, shift).
-    """
+    """Aggregate per-shift spatial + cycle features (kept lean for speed)."""
     g = g.sort_values("ts").copy()
     n = len(g)
     if n == 0:
@@ -285,40 +324,9 @@ def aggregate_shift_spatial(g: pd.DataFrame) -> pd.Series:
         prev_exc = g["near_excavator"].shift(1).fillna(0)
         loading_visits = int(((g["near_excavator"] == 1) & (prev_exc == 0)).sum())
 
-    # ── Haul cycle count ─────────────────────────────────────────
-    # Best estimate: max of dump_count_sig, dump_transitions, loading_visits
-    # Prefer dump switch signal when available (most reliable)
-    haul_cycles = max(dump_count_sig, dump_transitions)
-
-    # ── Load state speed features ─────────────────────────────────
-    # Loaded = between load_zone (or exc_proximity) departure and dump_zone arrival
-    # Heuristic: points ON haul road + speed > 2 → differentiate by direction
-    # Simple proxy: use speed quantiles on haul road pings
-    loaded_speed_mean = 0.0
-    empty_speed_mean  = 0.0
-    loaded_km = 0.0
-    empty_km  = 0.0
-
-    if "near_excavator" in g.columns and "in_dump_zone" in g.columns:
-        # Assign load state using spatial transitions
-        state = np.zeros(n, dtype=int)  # 0=unknown, 1=loaded, 2=empty
-        cur = 0
-        for i in range(n):
-            if g["near_excavator"].iloc[i] == 1:
-                cur = 1  # just loaded
-            elif g["in_dump_zone"].iloc[i] == 1:
-                cur = 2  # just dumped → empty
-            state[i] = cur
-
-        loaded_mask = state == 1
-        empty_mask  = state == 2
-
-        spd_loaded = g.loc[loaded_mask & moving, "speed"]
-        spd_empty  = g.loc[empty_mask  & moving, "speed"]
-        loaded_speed_mean = float(spd_loaded.mean()) if len(spd_loaded) > 0 else 0.0
-        empty_speed_mean  = float(spd_empty.mean())  if len(spd_empty)  > 0 else 0.0
-        loaded_km = g.loc[loaded_mask, "disthav"].sum() / 1000
-        empty_km  = g.loc[empty_mask,  "disthav"].sum() / 1000
+    # ── Haul cycle count proxy ────────────────────────────────────
+    # Prefer dump switch signal when available (most reliable), else spatial transitions.
+    haul_cycles = max(dump_count_sig, dump_transitions, loading_visits)
 
     # ── Congestion proxy ──────────────────────────────────────────
     # Stop-and-go on haul road = congestion
@@ -384,17 +392,11 @@ def aggregate_shift_spatial(g: pd.DataFrame) -> pd.Series:
         "dump_zone_transitions": dump_transitions,
         "load_zone_transitions": load_transitions,
         "haul_road_transitions": haul_transitions,
-        # Cycle
-        "haul_cycles":          haul_cycles,
-        "loading_visits":       loading_visits,
-        "loading_dwell_h":      loading_dwell_s / 3600,
-        "km_per_cycle":         shift_km / (haul_cycles + 1.0),
-        # Load-state speed
-        "loaded_speed_mean":    loaded_speed_mean,
-        "empty_speed_mean":     empty_speed_mean,
-        "loaded_km":            loaded_km,
-        "empty_km":             empty_km,
-        "loaded_empty_speed_ratio": loaded_speed_mean / (empty_speed_mean + 1e-6),
+        # Cycle proxies
+        "haul_cycles_spatial":   haul_cycles,
+        "loading_visits":        loading_visits,
+        "loading_dwell_h":       loading_dwell_s / 3600,
+        "km_per_cycle_spatial":  shift_km / (haul_cycles + 1.0),
         # External voltage
         "external_voltage_mean": ext_v,
         "external_voltage_max":  ext_v_max,
@@ -409,10 +411,17 @@ def aggregate_shift_spatial(g: pd.DataFrame) -> pd.Series:
 # ─────────────────────────────────────────────────────────────────
 
 LOAD_COLS = [
-    "vehicle", "mine_anon", "ts",
-    "latitude", "longitude", "altitude", "speed", "ignition", "disthav",
-    "analog_input_1", "external_voltage", "satellites", "gnss_hdop",
-    "axis_x", "axis_y", "axis_z", "battery_level", "angle",
+    "vehicle",
+    "mine_anon",
+    "ts",
+    "latitude",
+    "longitude",
+    "altitude",
+    "speed",
+    "ignition",
+    "disthav",
+    "analog_input_1",
+    "external_voltage",
 ]
 
 
@@ -425,6 +434,7 @@ def process_file(
     fpath: Path,
     mine_layers: dict,
     dumper_set: set,
+    exc_positions_utm: dict[str, np.ndarray],
 ) -> pd.DataFrame:
     print(f"  {fpath.name}...")
     try:
@@ -451,9 +461,6 @@ def process_file(
     df = df[df["speed"] <= 80].copy()
     df["speed"] = df["speed"].clip(0, 60)
 
-    # Extract excavator positions BEFORE filtering to dumpers
-    exc_pos = extract_excavator_positions(df)
-
     # Filter to dumpers
     df = df[df["vehicle"].isin(dumper_set)].copy()
     if len(df) == 0:
@@ -463,9 +470,9 @@ def process_file(
     if mine_layers:
         df = add_zone_flags_vectorized(df, mine_layers)
 
-    # Add excavator proximity
-    if not exc_pos.empty:
-        df = add_excavator_proximity(df, exc_pos)
+    # Add excavator proximity (fast anchors)
+    if exc_positions_utm:
+        df = add_excavator_proximity_fast(df, exc_positions_utm)
 
     # Aggregate per shift
     gkey = ["vehicle", "date", "shift"]
@@ -502,7 +509,7 @@ def add_vehicle_stats(labeled: pd.DataFrame, train: pd.DataFrame, test: pd.DataF
             veh_std_km=("shift_km", "std"),
             veh_mean_ign_h=("ignition_on_hours", "mean"),
             veh_mean_idle_frac=("idle_fraction", "mean"),
-            veh_mean_cycles=("haul_cycles", "mean"),
+            veh_mean_cycles_spatial=("haul_cycles_spatial", "mean"),
             veh_mean_climb=("total_climb_m", "mean"),
             veh_mean_ext_v=("external_voltage_mean", "mean"),
         )
@@ -586,11 +593,22 @@ def main():
     print(f"\nTrain files: {[f.name for f in train_files]}")
     print(f"Test files:  {[f.name for f in test_files]}")
 
+    print("\nComputing excavator anchor positions (fast)...")
+    exc_positions_utm = compute_excavator_mean_positions(DATA, all_tel)
+    for mine_id, anchors in exc_positions_utm.items():
+        print(f"  {mine_id}: {len(anchors)} exc anchors")
+
     # ── Train ────────────────────────────────────────────────────
     print("\nProcessing training telemetry (spatial + cycles)...")
     train_chunks = []
     for f in train_files:
-        chunk = process_file(f, mine_layers, dumper_set)
+        out_part = PARTS_DIR / f"train__{f.stem}.parquet"
+        if out_part.exists():
+            chunk = pd.read_parquet(out_part)
+        else:
+            chunk = process_file(f, mine_layers, dumper_set, exc_positions_utm)
+            if len(chunk) > 0:
+                chunk.to_parquet(out_part, index=False)
         if len(chunk) > 0:
             train_chunks.append(chunk)
         gc.collect()
@@ -601,7 +619,13 @@ def main():
     print("\nProcessing test telemetry (spatial + cycles)...")
     test_chunks = []
     for f in test_files:
-        chunk = process_file(f, mine_layers, dumper_set)
+        out_part = PARTS_DIR / f"test__{f.stem}.parquet"
+        if out_part.exists():
+            chunk = pd.read_parquet(out_part)
+        else:
+            chunk = process_file(f, mine_layers, dumper_set, exc_positions_utm)
+            if len(chunk) > 0:
+                chunk.to_parquet(out_part, index=False)
         if len(chunk) > 0:
             test_chunks.append(chunk)
         gc.collect()
@@ -664,7 +688,7 @@ def main():
 
     # ── Spatial feature coverage ──────────────────────────────────
     for col in ["frac_in_dump_zone", "frac_in_load_zone", "frac_on_haul_road",
-                "haul_cycles", "loading_visits"]:
+                "haul_cycles_spatial", "loading_visits"]:
         if col in train_feats.columns:
             nz = (train_feats[col] > 0).sum()
             print(f"  {col}: non-zero in {nz}/{len(train_feats)} rows ({100*nz/len(train_feats):.1f}%)")
