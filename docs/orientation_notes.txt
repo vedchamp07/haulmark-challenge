@@ -1,0 +1,26 @@
+The name of the game is analysing fuel plots from all the dumpers.
+If the refueling file (rfid) and the fuel consumption do not match in their timestamps, then there is something wrong. RFID is the ground truth, we can always assume it to be true. Fuel consumption graph made by sensors may not be reliable. If it isn’t reliable, determine why. Is it because it is placed at an inclination?
+Eliminate the cases where fuel and refueling data don’t match.
+Dump switch signal (or analog_input_1): 1V means vehicle is moving, 0.1V means vehicle is idling, anything above 2.5V means vehicle is currently dumping
+An entire cycle is: loading—>haul—>dump—>empty haul—>loading
+If dump switch signal is not given how will you know if dump has occurred? 
+You can learn that distance traveled while it is dumping is going to be 0.
+Also, you can get location of dumping spots from other pre-existing data, you can easily infer that if a truck is not covering any distance at that particular location, it is probably dumping.
+More reliable signals started from 17th february, all 15 dumpers were wired by 1st march.
+Make your model identify congestion of trucks from a particular driver’s behaviour.
+Tonnage is not a factor, assume each dumper to be loaded to the full 100 tons or whatever. Irrelevant.
+We identify loading part of the cycle by looking at excavator location (their names start with Exc). They don’t move a lot, don’t predict fuel for them.
+Each dumper is assigned to only one excavator.
+Maximum fuel consumption takes place during haul. 2nd max is during empty haul and 3rd max is at idling.
+How do you get the excavator location? It is hidden in the telemetry data.
+Match the latitude, longitude and altitude of excavator to the dumper if you want to determine if the dumper is getting loaded (without the use of other signals, maybe)
+gsm_signal just tells if network connection is 100% or less than it.
+ts and received_ts are used to show how delayed a signal can get. you could possibly use it to map the shadowed areas where network is lost. but we shud only be interested with ts and not received_ts.
+hdop: some jingo term. hdop should be 0 ideally, anything <1 is good, anything above 4 should be discarded. but hdop isn’t needed for fuel efficiency. it is needed for location accuracy.
+disthav is measured in meters, cumdist in kilometers
+angle by itself is not very important, but if the angle changes too much then it could be. 0 degrees means facing north.
+fuel prediction is just to check your ml skills; part 2 (actual usefulness) is attribution to the various factors it was high.
+evaluation frmo now onwards will be shift-wise
+look at congestion to determine stoppage density, speed variations, driver behaviour. speed depends on operator, stoppage density may or may not depend on operator.
+by aggregating the ignition 1s you can calculate time the machine was on. you can also do this by reading hmr_dpr (which shows in hours). but. seeing the ignition data is more helpful as you can see how many times ignition is turned on or off.
+use telemetry data to get number of trips taken and use it to predict fuel volume.

@@ -1,0 +1,88 @@
+DATA: /kaggle/input/competitions/mindshift-analytics-haul-mark-challenge
+OUT:  /kaggle/working
+geopandas available — spatial features ENABLED
+
+=== Loading spatial layers ===
+  mine001: layers=['bench', 'haul_road', 'ml_boundary', 'mineral_stock', 'ob_dump']
+  mine002: layers=['bench', 'haul_road', 'ml_boundary', 'mineral_stock', 'nh_road', 'ob_dump', 'village_road']
+
+=== Loading fleet ===
+Dumpers: 43
+Train files: 5, Test files: 3
+
+=== Processing training telemetry ===
+  telemetry_2026-01-01_2026-01-10.parquet...
+  telemetry_2026-01-11_2026-01-20.parquet...
+  telemetry_2026-02-01_2026-02-10.parquet...
+  telemetry_2026-02-11_2026-02-20.parquet...
+  telemetry_2026-03-01_2026-03-11.parquet...
+Train: (4468, 61)
+
+=== Processing test telemetry ===
+  telemetry_2026-01-21_2026-01-31.parquet...
+  telemetry_2026-02-21_2026-02-28.parquet...
+  telemetry_2026-03-12_2026-03-20.parquet...
+Test: (2431, 61)
+
+=== Merging targets ===
+Labeled: 4376 / 4468
+Refuel features: 12
+
+=== Spatial feature coverage ===
+  frac_dump_zone: non-zero 3977/4376 (91%)
+  frac_load_zone: non-zero 3486/4376 (80%)
+  frac_haul_road: non-zero 3861/4376 (88%)
+  haul_cycles: non-zero 4155/4376 (95%)
+  loading_visits: non-zero 3341/4376 (76%)
+
+=== Training model ===
+Features (84): ['n_pings', 'ign_h', 'mov_h', 'idle_h', 'shift_km', 'total_climb_m', 'total_descent_m', 'altitude_mean', 'altitude_std', 'altitude_max'] ...
+  Fold 1: RMSE=43.11L  (iter=241)
+  Fold 2: RMSE=53.25L  (iter=251)
+  Fold 3: RMSE=58.02L  (iter=246)
+  Fold 4: RMSE=45.46L  (iter=258)
+  Fold 5: RMSE=42.63L  (iter=675)
+
+OOF RMSE: 48.87L
+
+Top 20 features:
+             feature         gain
+       ext_v_x_mov_h 2.446012e+08
+               mov_h 1.006920e+08
+            shift_km 5.799822e+07
+          hour_start 1.790363e+07
+          ext_v_mean 8.969106e+06
+    haul_road_enters 7.659629e+06
+              idle_h 7.049399e+06
+       ext_v_x_ign_h 6.763447e+06
+ veh_shift_std_acons 6.750888e+06
+        day_of_month 6.121249e+06
+        km_per_cycle 6.059138e+06
+               ign_h 5.663988e+06
+veh_shift_mean_acons 4.964970e+06
+       total_climb_m 4.435989e+06
+         veh_mean_km 4.350025e+06
+       altitude_mean 4.138446e+06
+   distance_per_dump 4.041600e+06
+            hour_end 4.008662e+06
+      frac_haul_road 4.007673e+06
+         load_zone_h 3.584422e+06
+
+=== Generating submission ===
+Missing predictions: 92
+Submission stats:
+count    1735.000000
+mean      152.624193
+std        97.754478
+min         0.000000
+25%        65.439167
+50%       167.030710
+75%       235.345126
+max       331.235630
+Name: Predicted, dtype: float64
+
+Saved: /kaggle/working/submission_spatial_oof48.87_mean152.6.csv
+Also saved: /kaggle/working/submission.csv
+
+Previous best LB: 3375.61  (OOF was 50.73L)
+This run OOF:     48.87L

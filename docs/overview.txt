@@ -1,0 +1,139 @@
+Overview
+Dumper Fuel Consumption Prediction Challenge
+Mindshift Analytics × AI & SW Guild, IIT Madras
+
+Fuel is one of the largest operating costs in open-cast iron ore mining. Large fleets of dumpers continuously transport material between excavation faces, stockpiles, crushers, and dump locations — consuming significant volumes of diesel daily. Even marginal improvements in fuel efficiency have direct impact on operating costs and sustainability.
+
+Yet fuel consumption is hard to predict. The same dumper, on the same mine, can consume significantly different amounts of fuel depending on the route taken, the terrain it traverses, the operator behind the wheel, and operational conditions on any given shift.
+
+The Challenge
+Given telemetry, spatial map data, and refuelling records, your task is to estimate expected fuel consumption and identify abnormal excess fuel use at the dumper and route level.
+
+Why It's Hard
+Fuel consumption in dumpers is shaped by a complex interaction of factors:
+
+Haul Road Design & Conditions — gradient and net lift between load and dump points, rolling resistance, road curvature, and maintenance quality all directly affect energy demand.
+
+Mine Geometry — bench structure, elevation differences, terrain variability, and the distances between load and dump zones create route-specific difficulty profiles that no single metric captures.
+
+Operator Behavior — acceleration and braking patterns, throttle discipline, idling time, and driving consistency introduce significant per-operator variation even on identical routes.
+
+Operational Dynamics — loading efficiency, queuing delays, and cycle time variation add further noise to any consumption signal.
+
+What You'll Build
+A model (or set of models) that can accurately predict per-cycle fuel consumption from measurable signals — and generalize across dumpers, operators, and routes.
+
+Start
+
+4 days ago
+Close
+3 days to go
+Objective
+Training and Test Set Description
+1. Prediction Goal
+The primary objective is to build a model that can predict the total daily fuel consumption for each vehicle. This involves using high-frequency telemetry data to forecast aggregated daily metrics.
+
+The model should also be able to predict other daily performance indicators, such as:
+
+Production Hours
+Idle Hours
+Distance Traveled (KM)
+Total Tonnage Hauled
+2. Training Set (df)
+The training set contains high-frequency telemetry data for a specific period and is designed to be used for model development.
+
+Content: It includes detailed sensor readings (speed, altitude, ignition, etc.) and location data.
+Target Variables: Crucially, this dataset contains the aggregated daily production report (DPR) values, which serve as the ground truth for training your model. These include:
+fuel_volume: The primary target for fuel consumption prediction.
+prod_hr_dpr
+idle_hr_dpr
+maint_hr_dpr
+bd_hr_dpr
+hmr_dpr
+km_dpr
+tonnage
+3. Test Set (df_test)
+The test set contains telemetry data from a different time period and is used to evaluate the performance of your trained model on unseen data.
+
+Content: It has the same high-frequency telemetry features as the training set (e.g., speed, altitude, ignition).
+Unavailable Columns: To simulate a real-world prediction scenario, the following columns (the target variables) have been removed from the test set and will not be available for your predictions:
+fuel_volume
+prod_hr_dpr
+idle_hr_dpr
+maint_hr_dpr
+bd_hr_dpr
+hmr_dpr
+km_dpr
+tonnage
+Your task is to use the features available in the test set to predict these missing daily values.
+
+Explanation of Missing Columns
+prod_hr_dpr: Production Hours DPR - Hours the vehicle was productive.
+idle_hr_dpr: Idle Hours DPR - Hours the vehicle was idle.
+maint_hr_dpr: Maintenance Hours DPR - Hours the vehicle was under maintenance.
+tonnage: Tonnage - Weight of material hauled (in tons).
+bd_hr_dpr: Breakdown Hours DPR - Hours the vehicle was broken down.
+hmr_dpr: Hour Meter Reading DPR - Total operational hours from the hour meter.
+fuel_volume: Fuel Volume - Volume of fuel consumed.
+km_dpr: Kilometer DPR - Distance traveled in kilometers.
+Description
+Description
+Objective
+Build models that estimate the fuel consumption of dumpers for haul cycles between loading and dumping locations, using telemetry, spatial data, and operational signals.
+
+Specifically, your model should be able to:
+
+Predict specific fuel consumed (in litres) for a dumper operating from a given load point to a dump point.
+Predict generic fuel consumed (in litres) based on exposure (hours of operation), terrain (distance, lift, undulations, road zig-zag), and behavior (speed, stoppage density, etc.).
+Validate against actuals by showing that aggregated model predictions align with daily or shift-wise actual fuel consumption.
+Data Provided
+Dumper Telemetry
+High-frequency GPS and sensor data for each dumper, including timestamp, location, speed, altitude, heading, ignition status, and dump signal (where available). This is the primary data source for reconstructing haul cycles and deriving behavioral and terrain features.
+
+Loader / Excavator Telemetry
+Position and operating status data for loading equipment. Useful for identifying loading locations, inferring loading events, and understanding dumper-loader interaction.
+
+Refuelling Transactions
+Event-level records capturing the timestamp, dumper ID, and quantity of fuel added for each refuelling event. Used to anchor fuel balance and validate consumption estimates:
+
+Actual Fuel Consumed = Opening Level + Refuelled − Closing Level
+Dump Switch Analog Signal (available from March 1st onward, select dumpers)
+An analog signal that activates during material discharge, providing explicit dump event markers. This is a key input for accurate cycle segmentation:
+
+Each activation corresponds to a dump event
+Haul cycles can be reconstructed as: Load → Travel → Dump
+Patterns learned from this signal can be transferred to earlier data where the signal is unavailable
+Spatial Data (GeoPackage)
+Geospatial layers defining the mine structure, used for geofencing, route identification, and terrain context:
+
+Layer	Description
+haul_road	Haul road network
+bench	Bench geometries
+ob_dump	Overburden dump areas
+stock / mineral_stock	Stockpile areas
+ml_boundary	Mine boundary
+cpu	Crushing plant
+office	Infrastructure areas
+All spatial layers are in UTM (EPSG:32645). Telemetry coordinates must be converted from WGS84 (EPSG:4326) before spatial analysis.
+
+Key Predictive Features
+The following parameters are established drivers of fuel consumption and should inform your feature engineering:
+
+Dumper ID and Operator ID
+Engine hours and idling hours
+Lead distance and net lift
+Gross elevation change
+Standard deviation of altitude
+Gradient / angle statistics
+Speed statistics
+Stop-go intensity
+Load state (empty or loaded)
+Participant-Derived Features
+You are encouraged to derive additional features from the raw data, including:
+
+Haul cycle segmentation (using dump switch and telemetry)
+Distance travelled and net lift per cycle
+Elevation variability, stop counts, idle duration
+Speed statistics and route identifiers (cluster-to-cluster)
+Loading and dumping dwell times
+Terrain overlays, haul road snapping, geofence-aware features

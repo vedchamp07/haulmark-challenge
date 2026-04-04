@@ -1,0 +1,79 @@
+
+=== Merging targets ===
+Labeled: 4476 / 4654
+RFID merged. Non-zero refuels in train: 1483
+
+Spatial feature coverage (labeled train):
+  frac_dump_zone: non-zero 0/4476 (0%)
+  frac_load_zone: non-zero 0/4476 (0%)
+  frac_haul_road: non-zero 0/4476 (0%)
+  haul_cycles: non-zero 1884/4476 (42%)
+  loading_visits: non-zero 1034/4476 (23%)
+
+=== Two-stage model ===
+Labeled: 4476, active: 3348, inactive: 1128
+Features (77): ['altitude_max', 'altitude_mean', 'altitude_min', 'altitude_range', 'altitude_std', 'climb_per_km', 'day_of_month', 'day_of_week', 'dump_sig_events', 'dump_sig_max'] ...
+
+--- Stage 1: Active/Inactive classifier ---
+  Fold 1: accuracy=0.981
+  Fold 2: accuracy=0.986
+  Fold 3: accuracy=0.946
+  Fold 4: accuracy=0.974
+  Fold 5: accuracy=0.978
+OOF accuracy: 0.973
+
+--- Stage 2: Consumption regressor (active shifts only) ---
+  Fold 1: RMSE=22.74L  (iter=202)
+  Fold 2: RMSE=22.92L  (iter=573)
+  Fold 3: RMSE=28.45L  (iter=674)
+  Fold 4: RMSE=34.80L  (iter=179)
+  Fold 5: RMSE=26.57L  (iter=296)
+
+OOF RMSE (active shifts only): 27.47L
+
+Top 20 features:
+        feature         gain
+  ext_v_x_mov_h 9.014415e+07
+          mov_h 5.598422e+07
+       shift_km 3.729005e+07
+   ext_v_per_km 1.568702e+07
+   physics_pred 6.344000e+06
+ max_total_trip 4.216680e+06
+  total_climb_m 3.561380e+06
+total_descent_m 2.580595e+06
+ min_total_trip 2.012525e+06
+  idle_fraction 1.827663e+06
+      ext_v_std 1.700937e+06
+  altitude_mean 1.686913e+06
+        n_pings 1.477769e+06
+   altitude_std 1.280840e+06
+        veh_lph 1.021965e+06
+    km_per_hour 1.011970e+06
+   climb_per_km 8.943932e+05
+      speed_std 8.366589e+05
+       speed_cv 8.338067e+05
+      speed_max 8.255759e+05
+
+OOF RMSE (combined, treating inactive as 0): 23.79L
+
+=== Generating submission ===
+Missing predictions: 30 / 1735
+
+Submission statistics:
+count    1735.000000
+mean      152.938301
+std       107.854536
+min         0.000000
+25%        36.747439
+50%       168.368321
+75%       248.376011
+max       343.337438
+Name: Predicted, dtype: float64
+Zeros: 9
+Near-zero (<10L): 389
+
+Saved: /kaggle/working/submission_v3_oof27.47_mean152.9.csv
+Also saved: /kaggle/working/submission.csv
+
+Previous best LB MSE: 3182.71  (OOF was 48.87L)
+This run OOF (active only): 27.47L
