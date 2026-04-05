@@ -21,6 +21,7 @@ Performance notes:
 from __future__ import annotations
 
 import gc
+import argparse
 import sys
 import warnings
 from pathlib import Path
@@ -35,10 +36,10 @@ warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-OUTPUT = ROOT / "outputs" / "spatial_features"
-OUTPUT.mkdir(parents=True, exist_ok=True)
-PARTS_DIR = OUTPUT / "parts"
-PARTS_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_OUTPUT = ROOT / "outputs" / "spatial_features"
+DEFAULT_OUTPUT.mkdir(parents=True, exist_ok=True)
+DEFAULT_PARTS_DIR = DEFAULT_OUTPUT / "parts"
+DEFAULT_PARTS_DIR.mkdir(parents=True, exist_ok=True)
 
 TEST_FILES = {
     "telemetry_2026-01-21_2026-01-31.parquet",
@@ -328,6 +329,71 @@ def aggregate_shift_spatial(g: pd.DataFrame) -> pd.Series:
     # Prefer dump switch signal when available (most reliable), else spatial transitions.
     haul_cycles = max(dump_count_sig, dump_transitions, loading_visits)
 
+    # ── Loaded vs empty haul behavior + cycle time proxy ─────────
+    loaded_haul_speed_mean = 0.0
+    empty_haul_speed_mean = 0.0
+    loaded_haul_speed_p90 = 0.0
+    empty_haul_speed_p90 = 0.0
+    loaded_haul_km = 0.0
+    empty_haul_km = 0.0
+    load_events = 0
+    dump_events = 0
+    cycle_time_min_p50 = 0.0
+
+    if "near_excavator" in g.columns and "in_dump_zone" in g.columns:
+        near = g["near_excavator"].to_numpy(dtype=int)
+        dum = g["in_dump_zone"].to_numpy(dtype=int)
+        near_prev = np.r_[0, near[:-1]]
+        dum_prev = np.r_[0, dum[:-1]]
+        load_evt = (near == 1) & (near_prev == 0)
+        dump_evt = (dum == 1) & (dum_prev == 0)
+        load_events = int(load_evt.sum())
+        dump_events = int(dump_evt.sum())
+
+        score = np.cumsum(load_evt.astype(int) - dump_evt.astype(int))
+        score = np.clip(score, 0, None)
+        loaded = score > 0
+        empty = (score == 0) & (np.cumsum(dump_evt.astype(int)) > 0)
+
+        if "on_haul_road" in g.columns:
+            on_haul = g["on_haul_road"].to_numpy(dtype=int) == 1
+        else:
+            on_haul = np.ones(n, dtype=bool)
+
+        spd_all = pd.to_numeric(g["speed"], errors="coerce").fillna(0).to_numpy(dtype=float)
+        moving_mask = (spd_all > 2.0) & on_haul
+
+        spd_loaded = spd_all[moving_mask & loaded]
+        spd_empty = spd_all[moving_mask & empty]
+
+        if spd_loaded.size:
+            loaded_haul_speed_mean = float(spd_loaded.mean())
+            loaded_haul_speed_p90 = float(np.percentile(spd_loaded, 90))
+        if spd_empty.size:
+            empty_haul_speed_mean = float(spd_empty.mean())
+            empty_haul_speed_p90 = float(np.percentile(spd_empty, 90))
+
+        if "disthav" in g.columns:
+            dist = pd.to_numeric(g["disthav"], errors="coerce").fillna(0).to_numpy(dtype=float)
+            loaded_haul_km = float(dist[on_haul & loaded].sum() / 1000.0)
+            empty_haul_km = float(dist[on_haul & empty].sum() / 1000.0)
+
+        if load_events > 0 and dump_events > 0:
+            ts_ns = g["ts"].astype("int64").to_numpy()
+            load_idx = np.where(load_evt)[0]
+            dump_idx = np.where(dump_evt)[0]
+            li = 0
+            deltas = []
+            for di in dump_idx:
+                while li + 1 < len(load_idx) and load_idx[li + 1] <= di:
+                    li += 1
+                if load_idx[li] <= di:
+                    dt_min = (ts_ns[di] - ts_ns[load_idx[li]]) / 1e9 / 60.0
+                    if 0 <= dt_min <= 300:
+                        deltas.append(dt_min)
+            if deltas:
+                cycle_time_min_p50 = float(np.median(deltas))
+
     # ── Congestion proxy ──────────────────────────────────────────
     # Stop-and-go on haul road = congestion
     stops = int(((g["speed"].shift(1).fillna(0) > 2) & (g["speed"] <= 2) & ign).sum())
@@ -400,6 +466,17 @@ def aggregate_shift_spatial(g: pd.DataFrame) -> pd.Series:
         # External voltage
         "external_voltage_mean": ext_v,
         "external_voltage_max":  ext_v_max,
+        # Loaded/empty haul behavior
+        "loaded_haul_speed_mean": loaded_haul_speed_mean,
+        "empty_haul_speed_mean":  empty_haul_speed_mean,
+        "loaded_haul_speed_p90":  loaded_haul_speed_p90,
+        "empty_haul_speed_p90":   empty_haul_speed_p90,
+        "loaded_haul_km":         loaded_haul_km,
+        "empty_haul_km":          empty_haul_km,
+        "loaded_empty_haul_speed_ratio": loaded_haul_speed_mean / (empty_haul_speed_mean + 1e-6),
+        "load_events":            load_events,
+        "dump_events":            dump_events,
+        "cycle_time_min_p50":     cycle_time_min_p50,
         # Time anchors
         "hour_start": int(g["ts"].iloc[0].hour),
         "hour_end":   int(g["ts"].iloc[-1].hour),
@@ -579,6 +656,19 @@ def aggregate_refuels(refuels: pd.DataFrame, offset_min: int = 0) -> pd.DataFram
 # ─────────────────────────────────────────────────────────────────
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--out-dir",
+        default=str(DEFAULT_OUTPUT),
+        help="Output directory (default: outputs/spatial_features)",
+    )
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir = out_dir / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
     fleet = pd.read_csv(DATA / "fleet.csv")
     dumper_set = set(fleet[fleet["fleet"] == "Dumper"]["vehicle"].tolist())
     print(f"Dumpers: {len(dumper_set)}")
@@ -602,7 +692,7 @@ def main():
     print("\nProcessing training telemetry (spatial + cycles)...")
     train_chunks = []
     for f in train_files:
-        out_part = PARTS_DIR / f"train__{f.stem}.parquet"
+        out_part = parts_dir / f"train__{f.stem}.parquet"
         if out_part.exists():
             chunk = pd.read_parquet(out_part)
         else:
@@ -619,7 +709,7 @@ def main():
     print("\nProcessing test telemetry (spatial + cycles)...")
     test_chunks = []
     for f in test_files:
-        out_part = PARTS_DIR / f"test__{f.stem}.parquet"
+        out_part = parts_dir / f"test__{f.stem}.parquet"
         if out_part.exists():
             chunk = pd.read_parquet(out_part)
         else:
@@ -693,9 +783,9 @@ def main():
             nz = (train_feats[col] > 0).sum()
             print(f"  {col}: non-zero in {nz}/{len(train_feats)} rows ({100*nz/len(train_feats):.1f}%)")
 
-    train_feats.to_csv(OUTPUT / "train_spatial.csv", index=False)
-    test_feats.to_csv(OUTPUT / "test_spatial.csv",   index=False)
-    print(f"\nSaved to {OUTPUT}/")
+    train_feats.to_csv(out_dir / "train_spatial.csv", index=False)
+    test_feats.to_csv(out_dir / "test_spatial.csv",   index=False)
+    print(f"\nSaved to {out_dir}/")
 
 
 if __name__ == "__main__":
