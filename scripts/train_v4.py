@@ -20,8 +20,16 @@ import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import mean_squared_error
+from scipy.stats import rankdata
 import warnings
 warnings.filterwarnings("ignore")
+
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -67,18 +75,19 @@ if rfid_files:
     rfid = pd.concat([pd.read_parquet(f) for f in rfid_files], ignore_index=True)
     rfid["ts"] = pd.to_datetime(rfid["ts"], utc=False)
     rfid["adj_date"], rfid["shift"] = assign_shift(rfid["ts"])
-    rfid_agg = rfid.groupby(["vehicle", "adj_date", "shift"]).agg(
-        rfid_liters=("litres", "sum"),
-        rfid_events=("litres", "count"),
+    # Day-level RFID aggregation (refuels straddle shift boundaries)
+    rfid_agg = rfid.groupby(["vehicle", "adj_date"]).agg(
+        rfid_liters_day=("litres", "sum"),
+        rfid_events_day=("litres", "count"),
     ).reset_index()
     rfid_agg.rename(columns={"adj_date": "date"}, inplace=True)
     rfid_agg["date"] = pd.to_datetime(rfid_agg["date"]).dt.date
-    train = safe_merge(train, rfid_agg, on=["vehicle", "date", "shift"])
-    test  = safe_merge(test,  rfid_agg, on=["vehicle", "date", "shift"])
+    train = safe_merge(train, rfid_agg, on=["vehicle", "date"])
+    test  = safe_merge(test,  rfid_agg, on=["vehicle", "date"])
     for df_ in [train, test]:
-        df_["rfid_liters"] = df_["rfid_liters"].fillna(0)
-        df_["rfid_events"] = df_["rfid_events"].fillna(0)
-    print(f"RFID: non-zero in train: {(train['rfid_liters'] > 0).sum()}")
+        df_["rfid_liters_day"] = df_["rfid_liters_day"].fillna(0)
+        df_["rfid_events_day"] = df_["rfid_events_day"].fillna(0)
+    print(f"RFID: non-zero in train: {(train['rfid_liters_day'] > 0).sum()}")
 
 # ── Vehicle aggregate features ────────────────────────────────────────────────
 train_clean = train[train["acons"].notna() & (train["acons"] > 0)].copy()
@@ -171,6 +180,17 @@ labeled["is_active_label"] = (labeled["acons"] > 10).astype(int)
 print(f"Labeled: {len(labeled)}, active: {labeled['is_active_label'].sum()}, "
       f"inactive: {(labeled['is_active_label']==0).sum()}")
 
+# ── Rank-transform altitude features to neutralize mine-depth drift ────────────
+altitude_cols = ["altitude_std", "altitude_range", "net_lift", "uphill_m"]
+alt_cols_present = [c for c in altitude_cols if c in train.columns and c in test.columns]
+if alt_cols_present:
+    combined = pd.concat([train[alt_cols_present], test[alt_cols_present]], ignore_index=True).fillna(0)
+    for col in alt_cols_present:
+        all_ranks = rankdata(combined[col].values, method='average') / len(combined)
+        train[f"{col}_rank"] = all_ranks[:len(train)]
+        test[f"{col}_rank"] = all_ranks[len(train):]
+    print(f"Rank-transformed altitude: {alt_cols_present}")
+
 feat_cols = get_features(labeled, test)
 print(f"Features: {len(feat_cols)}")
 print(f"New v4 features present: {[c for c in ['frac_dump_v4','frac_haul_v4','cumdist_km','accel_std','mine_enc','has_dump_switch'] if c in feat_cols]}")
@@ -180,7 +200,17 @@ y_all    = labeled["acons"].values
 y_active = labeled["is_active_label"].values
 groups   = labeled["vehicle"].astype("category").cat.codes.values
 X_test   = test[feat_cols].fillna(0)
-gkf      = GroupKFold(n_splits=5)
+
+# Forward-chained monthly CV (mirrors LB temporal structure)
+labeled["month"] = pd.to_datetime(labeled["date"]).dt.month
+fold_splits = [
+    (labeled[labeled["month"] == 1].index.tolist(),  # Train Jan
+     labeled[labeled["month"] == 2].index.tolist()), # Val Feb
+    (labeled[labeled["month"].isin([1, 2])].index.tolist(),  # Train Jan+Feb
+     labeled[labeled["month"] == 3].index.tolist()), # Val Mar
+]
+
+gkf      = GroupKFold(n_splits=5)  # Keep for classifier compatibility
 
 # Stage 1: classifier
 print("\n--- Stage 1: Active/Inactive classifier ---")
@@ -221,20 +251,75 @@ X_act = active_df[feat_cols].fillna(0)
 y_act = active_df["acons"].values
 g_act = active_df["vehicle"].astype("category").cat.codes.values
 
+# ── Optuna tuning on Fold 1 (Jan+Feb → Mar, hardest fold) ────────────────────
+regr_params_best = REGR_PARAMS.copy()
+if OPTUNA_AVAILABLE and len(fold_splits) > 1:
+    print("\n--- Optuna tuning on Fold 1 (Jan+Feb → Mar) ---")
+    tr_idx_abs, val_idx_abs = fold_splits[1]
+    tr_mask = active_df.index.isin(tr_idx_abs)
+    val_mask = active_df.index.isin(val_idx_abs)
+    tr_idx_opt = np.where(tr_mask)[0]
+    val_idx_opt = np.where(val_mask)[0]
+    
+    if len(tr_idx_opt) > 0 and len(val_idx_opt) > 0:
+        X_opt_tr, y_opt_tr = X_act.iloc[tr_idx_opt], y_act[tr_idx_opt]
+        X_opt_val, y_opt_val = X_act.iloc[val_idx_opt], y_act[val_idx_opt]
+        
+        def objective(trial):
+            p = dict(
+                objective="regression", metric="rmse",
+                learning_rate = trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
+                num_leaves    = trial.suggest_int('num_leaves', 15, 127),
+                max_depth     = trial.suggest_int('max_depth', 3, 10),
+                min_data_in_leaf = trial.suggest_int('min_data_in_leaf', 5, 50),
+                feature_fraction = trial.suggest_float('feature_fraction', 0.5, 1.0),
+                bagging_fraction = trial.suggest_float('bagging_fraction', 0.5, 1.0),
+                lambda_l1 = trial.suggest_float('lambda_l1', 0.0, 1.0),
+                lambda_l2 = trial.suggest_float('lambda_l2', 0.0, 1.0),
+                verbosity=-1, seed=42,
+            )
+            dtrain = lgb.Dataset(X_opt_tr, label=y_opt_tr)
+            dval = lgb.Dataset(X_opt_val, label=y_opt_val, reference=dtrain)
+            m = lgb.train(p, dtrain, valid_sets=[dval], num_boost_round=5000,
+                          callbacks=[lgb.early_stopping(300, verbose=False), lgb.log_evaluation(0)])
+            pred = m.predict(X_opt_val, num_iteration=m.best_iteration)
+            return rmse(y_opt_val, np.clip(pred, 0, None))
+        
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=100, show_progress_bar=False)
+        best_optuna_params = study.best_params
+        print(f"  Best Optuna RMSE: {study.best_value:.2f}L")
+        regr_params_best.update({k: best_optuna_params[k] for k in best_optuna_params 
+                                 if k in REGR_PARAMS})
+        print(f"  Updated REGR_PARAMS with Optuna tuning")
+
+print("\n--- Stage 2: Regressor (active shifts only, forward-chained monthly CV) ---")
 oof_reg    = np.zeros(len(active_df))
 reg_models = []
 fold_rmses = []
-gkf2 = GroupKFold(n_splits=5)
-for fold, (tr_idx, val_idx) in enumerate(gkf2.split(X_act, y_act, g_act), 1):
+
+for fold, (tr_idx_abs, val_idx_abs) in enumerate(fold_splits):
+    # Map absolute indices to active_df indices
+    tr_mask = active_df.index.isin(tr_idx_abs)
+    val_mask = active_df.index.isin(val_idx_abs)
+    tr_idx = np.where(tr_mask)[0]
+    val_idx = np.where(val_mask)[0]
+    
+    if len(val_idx) == 0 or len(tr_idx) == 0:
+        continue
+    
     dtrain = lgb.Dataset(X_act.iloc[tr_idx], label=y_act[tr_idx])
     dval   = lgb.Dataset(X_act.iloc[val_idx], label=y_act[val_idx], reference=dtrain)
-    reg = lgb.train(REGR_PARAMS, dtrain, valid_sets=[dval], num_boost_round=5000,
+    reg = lgb.train(regr_params_best, dtrain, valid_sets=[dval], num_boost_round=5000,
                     callbacks=[lgb.early_stopping(300, verbose=False), lgb.log_evaluation(1000)])
     oof_reg[val_idx] = reg.predict(X_act.iloc[val_idx], num_iteration=reg.best_iteration)
     reg_models.append(reg)
     fr = rmse(y_act[val_idx], np.clip(oof_reg[val_idx], 0, None))
     fold_rmses.append(fr)
-    print(f"  Fold {fold}: RMSE={fr:.2f}L  (iter={reg.best_iteration})")
+    val_months = labeled.loc[val_idx_abs, 'month'].unique()
+    tr_months = labeled.loc[tr_idx_abs, 'month'].unique()
+    print(f"  Fold {fold+1}: RMSE={fr:.2f}L  (iter={reg.best_iteration}) | "
+          f"train months {sorted(tr_months)} → val month {sorted(val_months)}")
 
 oof_reg = np.clip(oof_reg, 0, None)
 oof_rmse_active = rmse(y_act, oof_reg)
