@@ -38,3 +38,6 @@ Thumbs.db
 *.log
 *.tmp
 *.swp
+
+# Local editor/agent settings
+.claude/
